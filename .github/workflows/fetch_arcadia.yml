@@ -1,1 +1,125 @@
+name: fetch_arcadia
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch strategy JSON (try multiple base URLs)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STRATEGY_ID="405"
+          TS="$(date -u +'%Y%m%dT%H%M%SZ')"
+          OUT_DIR="data"
+          OUT_FILE="${OUT_DIR}/arcadia_strategy_${STRATEGY_ID}_${TS}.json"
+          LATEST_FILE="${OUT_DIR}/latest_strategy_${STRATEGY_ID}.json"
+
+          mkdir -p "${OUT_DIR}"
+
+          # Candidate API base URLs (we'll try each; first that returns valid JSON wins)
+          BASE_URLS=(
+            "https://api.arcadia.finance"
+            "https://staging.api.arcadia.finance"
+          )
+
+          # API path according to their docs listing (GET /v1/api/strategies/{strategy_id})
+          PATH="/v1/api/strategies/${STRATEGY_ID}"
+
+          echo "Target: strategy_id=${STRATEGY_ID}"
+          echo "Timestamp (UTC): ${TS}"
+          echo "Will try:"
+          for b in "${BASE_URLS[@]}"; do
+            echo "  - ${b}${PATH}"
+          done
+
+          SUCCESS=0
+          LAST_ERR=""
+
+          for BASE in "${BASE_URLS[@]}"; do
+            URL="${BASE}${PATH}"
+            echo ""
+            echo "== Trying: ${URL}"
+
+            # Fetch (with retry + user-agent)
+            HTTP_TMP="$(mktemp)"
+            BODY_TMP="$(mktemp)"
+
+            set +e
+            curl -sS -L \
+              --retry 3 --retry-delay 2 --retry-all-errors \
+              -H "accept: application/json" \
+              -H "user-agent: yield-verifier/0.1 (github-actions)" \
+              -w "%{http_code}" \
+              -o "${BODY_TMP}" \
+              "${URL}" > "${HTTP_TMP}"
+            CURL_EXIT=$?
+            set -e
+
+            HTTP_CODE="$(cat "${HTTP_TMP}" || true)"
+            rm -f "${HTTP_TMP}"
+
+            if [ "${CURL_EXIT}" -ne 0 ]; then
+              LAST_ERR="curl failed (exit=${CURL_EXIT}) for ${URL}"
+              echo "${LAST_ERR}"
+              rm -f "${BODY_TMP}"
+              continue
+            fi
+
+            if [ "${HTTP_CODE}" != "200" ]; then
+              LAST_ERR="non-200 HTTP (${HTTP_CODE}) for ${URL}"
+              echo "${LAST_ERR}"
+              echo "Response (first 300 chars):"
+              head -c 300 "${BODY_TMP}" || true
+              echo ""
+              rm -f "${BODY_TMP}"
+              continue
+            fi
+
+            # Validate JSON using python (available on ubuntu-latest)
+            if python -m json.tool "${BODY_TMP}" > "${OUT_FILE}"; then
+              echo "JSON OK. Saved: ${OUT_FILE}"
+              cp "${OUT_FILE}" "${LATEST_FILE}"
+              echo "Also updated: ${LATEST_FILE}"
+              echo "${URL}" > "${OUT_DIR}/source_url_strategy_${STRATEGY_ID}.txt"
+              rm -f "${BODY_TMP}"
+              SUCCESS=1
+              break
+            else
+              LAST_ERR="invalid JSON from ${URL}"
+              echo "${LAST_ERR}"
+              rm -f "${BODY_TMP}"
+              continue
+            fi
+          done
+
+          if [ "${SUCCESS}" -ne 1 ]; then
+            echo ""
+            echo "ERROR: Could not fetch valid JSON for strategy_id=${STRATEGY_ID}."
+            echo "Last error: ${LAST_ERR}"
+            exit 1
+          fi
+
+      - name: Commit fetched data (if changed)
+        run: |
+          set -euo pipefail
+          git status --porcelain
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "data: fetch Arcadia strategy 405"
+          git push
 
