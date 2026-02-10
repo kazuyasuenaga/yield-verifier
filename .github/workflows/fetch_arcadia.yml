@@ -33,24 +33,23 @@ jobs:
           )
 
           # API path according to their docs listing (GET /v1/api/strategies/{strategy_id})
-          PATH="/v1/api/strategies/${STRATEGY_ID}"
-
+          API_PATH="/v1/api/strategies/${STRATEGY_ID}"
+          
           echo "Target: strategy_id=${STRATEGY_ID}"
           echo "Timestamp (UTC): ${TS}"
           echo "Will try:"
           for b in "${BASE_URLS[@]}"; do
-            echo "  - ${b}${PATH}"
+            echo "  - ${b}${API_PATH}"
           done
 
           SUCCESS=0
           LAST_ERR=""
 
           for BASE in "${BASE_URLS[@]}"; do
-            URL="${BASE}${PATH}"
+            URL="${BASE}${API_PATH}"
             echo ""
             echo "== Trying: ${URL}"
-
-            # Fetch (with retry + user-agent)
+            
             HTTP_TMP="$(mktemp)"
             BODY_TMP="$(mktemp)"
 
