@@ -13,37 +13,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fetch Arcadia strategy data (Base 8453, strategyId=405)
+      - name: Fetch Arcadia strategies list and extract strategyId=405 (Base 8453)
         shell: bash
         run: |
           set -euo pipefail
 
-          STRATEGY_ID="405"
+          TARGET_STRATEGY_ID="405"
           CHAIN_ID="8453"
 
           TS="$(date -u +'%Y%m%dT%H%M%SZ')"
           OUT_DIR="data"
-          OUT_FILE="${OUT_DIR}/arcadia_strategy_${STRATEGY_ID}_${TS}.json"
-          LATEST_FILE="${OUT_DIR}/latest_strategy_${STRATEGY_ID}.json"
-          SOURCE_FILE="${OUT_DIR}/source_url_strategy_${STRATEGY_ID}.txt"
+
+          SNAPSHOT_FILE="${OUT_DIR}/arcadia_strategies_${CHAIN_ID}_${TS}.json"
+          LATEST_LIST_FILE="${OUT_DIR}/latest_strategies_${CHAIN_ID}.json"
+
+          EXTRACT_FILE="${OUT_DIR}/arcadia_strategy_${TARGET_STRATEGY_ID}_${TS}.json"
+          LATEST_EXTRACT_FILE="${OUT_DIR}/latest_strategy_${TARGET_STRATEGY_ID}.json"
+
+          SOURCE_FILE="${OUT_DIR}/source_url_chain_${CHAIN_ID}.txt"
 
           mkdir -p "${OUT_DIR}"
 
-          # Candidate API base URLs (we'll try each; first that returns valid JSON wins)
           BASE_URLS=(
             "https://api.arcadia.finance"
             "https://staging.api.arcadia.finance"
           )
 
-          # The API returns 422 unless required query params are included.
-          # We'll try multiple candidate endpoint shapes to find the one that works.
           URL_CANDIDATES=(
-            "/v1/api/strategies?chain_id=${CHAIN_ID}&query=${STRATEGY_ID}"
-            "/v1/api/strategies/${STRATEGY_ID}?chain_id=${CHAIN_ID}&query=${STRATEGY_ID}"
-            "/v1/api/strategy?chain_id=${CHAIN_ID}&query=${STRATEGY_ID}"
+            "/v1/api/strategies?chain_id=${CHAIN_ID}&query=${TARGET_STRATEGY_ID}"
+            "/v1/api/strategies?chain_id=${CHAIN_ID}&query="
+            "/v1/api/strategies?chain_id=${CHAIN_ID}"
           )
 
-          echo "Target: strategy_id=${STRATEGY_ID}"
+          echo "Target strategy_id: ${TARGET_STRATEGY_ID}"
           echo "Chain: ${CHAIN_ID}"
           echo "Timestamp (UTC): ${TS}"
           echo "Will try:"
@@ -79,12 +81,13 @@ jobs:
                 continue
               fi
 
-              # Validate JSON (pretty-print to OUT_FILE)
-              if python -m json.tool /tmp/arcadia_body.json > "${OUT_FILE}"; then
-                echo "JSON OK. Saved: ${OUT_FILE}"
-                cp "${OUT_FILE}" "${LATEST_FILE}"
-                echo "Also updated: ${LATEST_FILE}"
+              # Validate JSON (pretty-print) and save as snapshot + latest list
+              if python -m json.tool /tmp/arcadia_body.json > "${SNAPSHOT_FILE}"; then
+                echo "JSON OK. Saved snapshot: ${SNAPSHOT_FILE}"
+                cp "${SNAPSHOT_FILE}" "${LATEST_LIST_FILE}"
+                echo "Also updated latest list: ${LATEST_LIST_FILE}"
                 echo "${URL}" > "${SOURCE_FILE}"
+
                 SUCCESS=1
                 break 2
               else
@@ -100,10 +103,41 @@ jobs:
 
           if [ "${SUCCESS}" -ne 1 ]; then
             echo ""
-            echo "ERROR: Could not fetch valid JSON for strategy_id=${STRATEGY_ID} (chain_id=${CHAIN_ID})."
+            echo "ERROR: Could not fetch valid JSON for chain_id=${CHAIN_ID}."
             echo "Last error: ${LAST_ERR}"
             exit 1
           fi
+
+          # Extract the single object where strategy_id == TARGET_STRATEGY_ID
+          python - << 'PY'
+          import json, sys, pathlib
+          target_id = int("405")
+          latest_list = pathlib.Path("data/latest_strategies_8453.json")
+          out_file = pathlib.Path("data/latest_strategy_405.json")
+
+          data = json.loads(latest_list.read_text(encoding="utf-8"))
+
+          if not isinstance(data, list):
+            print("ERROR: expected a JSON list of strategies, got:", type(data), file=sys.stderr)
+            sys.exit(1)
+
+          match = None
+          for obj in data:
+            if isinstance(obj, dict) and obj.get("strategy_id") == target_id:
+              match = obj
+              break
+
+          if match is None:
+            print(f"ERROR: strategy_id={target_id} not found in list (len={len(data)}).", file=sys.stderr)
+            sys.exit(1)
+
+          out_file.write_text(json.dumps(match, indent=2, sort_keys=True), encoding="utf-8")
+          print("Extracted to:", out_file)
+          PY
+
+          # Also keep a timestamped extracted snapshot for history
+          cp "${LATEST_EXTRACT_FILE}" "${EXTRACT_FILE}"
+          echo "Saved extracted snapshot: ${EXTRACT_FILE}"
 
       - name: Commit fetched data (if changed)
         run: |
@@ -115,5 +149,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
-          git commit -m "data: fetch Arcadia strategy 405 (chain 8453)"
+          git commit -m "data: fetch Arcadia (8453) and extract strategy 405"
           git push
