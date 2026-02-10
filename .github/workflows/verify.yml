@@ -2,6 +2,11 @@ name: verify
 
 on:
   workflow_dispatch:
+    inputs:
+      displayed_apy_percent:
+        description: "APY shown on Arcadia website (percent, e.g. 293814.8). Leave blank if unknown."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -15,6 +20,8 @@ jobs:
 
       - name: Build receipt from latest_strategy_405.json
         shell: bash
+        env:
+          DISPLAYED_APY_PERCENT: ${{ github.event.inputs.displayed_apy_percent }}
         run: |
           set -euo pipefail
 
@@ -35,17 +42,18 @@ jobs:
           import json, hashlib, time, sys
           from pathlib import Path
 
+          displayed_str = (sys.environ.get("DISPLAYED_APY_PERCENT") or "").strip()
+
           in_path = Path("data/latest_strategy_405.json")
           raw = json.loads(in_path.read_text(encoding="utf-8"))
 
-          # --- Helpers ---
           def sha256_hex(b: bytes) -> str:
               return hashlib.sha256(b).hexdigest()
 
           def canonical_json_bytes(obj) -> bytes:
               return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
-          # --- Extract minimal inputs ---
+          # --- Required fields ---
           required_keys = ["strategy_id", "strategy_name", "strategy_apy"]
           missing = [k for k in required_keys if k not in raw]
 
@@ -53,51 +61,71 @@ jobs:
           strategy_name = raw.get("strategy_name")
           strategy_apy_raw = raw.get("strategy_apy")
 
-          # We also capture a few context fields if present:
           underlyings = raw.get("underlyings", [])
           details = raw.get("details", {})
-          tvl = None
-          if isinstance(details, dict):
-              tvl = details.get("total_value_locked")
+          tvl = details.get("total_value_locked") if isinstance(details, dict) else None
 
-          # --- Unit ambiguity handling ---
-          # NOTE: We do NOT "decide" silently. We emit candidates and warn if ambiguous.
-          unit_hint = "unknown"
-          apy_candidates = {}
-          unit_ambiguous = True
+          # --- Unit decision (confirmed by user observation) ---
+          # Arcadia UI shows 293814.8% while API gives ~2938.1, which matches when multiplying by 100.
+          apy_fraction = None
+          apy_percent_from_api = None
+          unit_ok = False
+          unit_detail = "unknown"
 
           try:
-              x = float(strategy_apy_raw)
-              apy_candidates["as_fraction"] = x  # interpret as already fraction (e.g. 0.033 = 3.3%)
-              apy_candidates["as_percent_div_100"] = x / 100.0  # interpret as percent (e.g. 3.3 => 0.033)
-              # Heuristic ONLY for warning level, not for choosing:
-              if 0 <= x <= 1:
-                  unit_hint = "likely_fraction"
-                  unit_ambiguous = False
-              else:
-                  unit_hint = "likely_percent_or_scaled"
-                  unit_ambiguous = True
+              apy_fraction = float(strategy_apy_raw)
+              apy_percent_from_api = apy_fraction * 100.0
+              unit_ok = True
+              unit_detail = "confirmed: api_fraction * 100 = displayed_percent"
           except Exception:
-              unit_hint = "non_numeric"
-              unit_ambiguous = True
+              unit_ok = False
+              unit_detail = "strategy_apy not numeric"
+
+          # Optional: compare against website-displayed APY% if provided
+          displayed_apy_percent = None
+          deviation_abs_percent = None
+          deviation_rel = None
+          deviation_check_pass = None
+          deviation_detail = "not_provided"
+
+          if displayed_str:
+              try:
+                  displayed_apy_percent = float(displayed_str)
+                  if apy_percent_from_api is not None:
+                      deviation_abs_percent = apy_percent_from_api - displayed_apy_percent
+                      deviation_rel = deviation_abs_percent / displayed_apy_percent if displayed_apy_percent != 0 else None
+                      # Tolerance: very loose for now (we mainly want to detect gross mismatch)
+                      # pass if within 0.5% of displayed value (relative)
+                      tol = 0.005
+                      deviation_check_pass = (deviation_rel is not None and abs(deviation_rel) <= tol)
+                      deviation_detail = f"rel_tol={tol}"
+                  else:
+                      deviation_check_pass = False
+                      deviation_detail = "api_percent_unavailable"
+              except Exception:
+                  displayed_apy_percent = None
+                  deviation_check_pass = False
+                  deviation_detail = "invalid_displayed_input"
 
           # --- Checks ---
           checks = []
-
           checks.append({
               "name": "input_present",
               "pass": len(missing) == 0,
               "detail": ("missing: " + ", ".join(missing)) if missing else "ok"
           })
-
           checks.append({
-              "name": "unit_unambiguous",
-              "pass": (unit_ambiguous is False),
-              "detail": unit_hint
+              "name": "unit_confirmed",
+              "pass": unit_ok,
+              "detail": unit_detail
+          })
+          checks.append({
+              "name": "displayed_match_within_tolerance",
+              "pass": (deviation_check_pass if deviation_check_pass is not None else True),
+              "detail": deviation_detail
           })
 
-          # Reproducibility: canonicalize inputs and outputs and hash them.
-          # Inputs for digest are the extracted minimal set + target identifiers.
+          # Digests input: extracted + displayed (if provided) + identifiers
           inputs_for_digest = {
               "target": {
                   "chain_id": 8453,
@@ -111,12 +139,14 @@ jobs:
               "context": {
                   "tvl": tvl,
                   "underlyings": underlyings
+              },
+              "user_observed": {
+                  "displayed_apy_percent": displayed_apy_percent
               }
           }
 
-          # Output payload (receipt core)
-          receipt_core = {
-              "spec_version": "v0.1.0",
+          receipt = {
+              "spec_version": "v0.2.0",
               "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
               "target": {
                   "chain_id": 8453,
@@ -124,19 +154,24 @@ jobs:
                   "strategy_name": strategy_name,
                   "url": "https://arcadia.finance/farm/8453/v2?strategyId=405"
               },
-              "status": None,  # filled below
+              "status": None,
               "inputs": {
-                  "strategy_apy_raw": strategy_apy_raw,
+                  "strategy_apy_raw_fraction": strategy_apy_raw,
+                  "displayed_apy_percent_user": displayed_apy_percent,
                   "tvl_usd": tvl,
                   "underlyings": underlyings
               },
               "assumptions": {
-                  "apy_unit": "unknown",
-                  "unit_hint": unit_hint,
-                  "note": "Until unit is confirmed, we publish multiple APY interpretations and mark status as warn."
+                  "apy_unit": "fraction",
+                  "displayed_unit": "percent",
+                  "conversion": "apy_percent = strategy_apy * 100",
+                  "note": "Unit confirmed using Arcadia UI observation."
               },
               "computed": {
-                  "apy_candidates_fraction": apy_candidates
+                  "apy_fraction": apy_fraction,
+                  "apy_percent_from_api": apy_percent_from_api,
+                  "deviation_abs_percent": deviation_abs_percent,
+                  "deviation_rel": deviation_rel
               },
               "checks": checks,
               "digests": {
@@ -146,21 +181,27 @@ jobs:
           }
 
           input_digest = sha256_hex(canonical_json_bytes(inputs_for_digest))
-          receipt_core["digests"]["input_digest_sha256"] = input_digest
+          receipt["digests"]["input_digest_sha256"] = input_digest
 
-          # Determine status: fail if missing required, warn if unit ambiguous, pass otherwise.
+          # Status logic:
+          # - fail if missing required or unit not confirmed
+          # - warn if displayed input provided but mismatch beyond tolerance
+          # - pass otherwise
           if any(c["name"] == "input_present" and not c["pass"] for c in checks):
               status = "fail"
-          elif any(c["name"] == "unit_unambiguous" and not c["pass"] for c in checks):
+          elif any(c["name"] == "unit_confirmed" and not c["pass"] for c in checks):
+              status = "fail"
+          elif (deviation_check_pass is False):
               status = "warn"
           else:
               status = "pass"
-          receipt_core["status"] = status
 
-          output_digest = sha256_hex(canonical_json_bytes(receipt_core))
-          receipt_core["digests"]["output_digest_sha256"] = output_digest
+          receipt["status"] = status
 
-          Path("artifacts/receipt.json").write_text(json.dumps(receipt_core, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+          output_digest = sha256_hex(canonical_json_bytes(receipt))
+          receipt["digests"]["output_digest_sha256"] = output_digest
+
+          Path("artifacts/receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
           print("Wrote artifacts/receipt.json with status =", status)
           PY
 
@@ -178,5 +219,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add artifacts/
-          git commit -m "receipt: verify strategy 405"
+          git commit -m "receipt: verify strategy 405 (unit confirmed)"
           git push
