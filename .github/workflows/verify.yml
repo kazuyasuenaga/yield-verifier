@@ -39,10 +39,10 @@ jobs:
           mkdir -p "${OUT_DIR}"
 
           python - << 'PY'
-          import json, hashlib, time, sys
+          import json, hashlib, time, sys, os
           from pathlib import Path
 
-          displayed_str = (sys.environ.get("DISPLAYED_APY_PERCENT") or "").strip()
+          displayed_str = (os.environ.get("DISPLAYED_APY_PERCENT") or "").strip()
 
           in_path = Path("data/latest_strategy_405.json")
           raw = json.loads(in_path.read_text(encoding="utf-8"))
@@ -66,7 +66,6 @@ jobs:
           tvl = details.get("total_value_locked") if isinstance(details, dict) else None
 
           # --- Unit decision (confirmed by user observation) ---
-          # Arcadia UI shows 293814.8% while API gives ~2938.1, which matches when multiplying by 100.
           apy_fraction = None
           apy_percent_from_api = None
           unit_ok = False
@@ -95,8 +94,7 @@ jobs:
                       deviation_abs_percent = apy_percent_from_api - displayed_apy_percent
                       deviation_rel = deviation_abs_percent / displayed_apy_percent if displayed_apy_percent != 0 else None
                       # Tolerance: very loose for now (we mainly want to detect gross mismatch)
-                      # pass if within 0.5% of displayed value (relative)
-                      tol = 0.005
+                      tol = 0.005  # 0.5% relative tolerance
                       deviation_check_pass = (deviation_rel is not None and abs(deviation_rel) <= tol)
                       deviation_detail = f"rel_tol={tol}"
                   else:
@@ -146,7 +144,7 @@ jobs:
           }
 
           receipt = {
-              "spec_version": "v0.2.0",
+              "spec_version": "v0.2.1",
               "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
               "target": {
                   "chain_id": 8453,
@@ -183,10 +181,7 @@ jobs:
           input_digest = sha256_hex(canonical_json_bytes(inputs_for_digest))
           receipt["digests"]["input_digest_sha256"] = input_digest
 
-          # Status logic:
-          # - fail if missing required or unit not confirmed
-          # - warn if displayed input provided but mismatch beyond tolerance
-          # - pass otherwise
+          # Status logic
           if any(c["name"] == "input_present" and not c["pass"] for c in checks):
               status = "fail"
           elif any(c["name"] == "unit_confirmed" and not c["pass"] for c in checks):
@@ -201,7 +196,10 @@ jobs:
           output_digest = sha256_hex(canonical_json_bytes(receipt))
           receipt["digests"]["output_digest_sha256"] = output_digest
 
-          Path("artifacts/receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+          Path("artifacts/receipt.json").write_text(
+              json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False),
+              encoding="utf-8"
+          )
           print("Wrote artifacts/receipt.json with status =", status)
           PY
 
