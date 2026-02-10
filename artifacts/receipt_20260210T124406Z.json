@@ -1,0 +1,58 @@
+{
+  "assumptions": {
+    "apy_unit": "unknown",
+    "note": "Until unit is confirmed, we publish multiple APY interpretations and mark status as warn.",
+    "unit_hint": "likely_percent_or_scaled"
+  },
+  "checks": [
+    {
+      "detail": "ok",
+      "name": "input_present",
+      "pass": true
+    },
+    {
+      "detail": "likely_percent_or_scaled",
+      "name": "unit_unambiguous",
+      "pass": false
+    }
+  ],
+  "computed": {
+    "apy_candidates_fraction": {
+      "as_fraction": 2938.1286657252813,
+      "as_percent_div_100": 29.38128665725281
+    }
+  },
+  "digests": {
+    "input_digest_sha256": "18aabd263b3de9c7cdbef0a30511c9fd9eb6bc946e967d9d40e4a02805220f96",
+    "output_digest_sha256": "40924ac6f2507bfb1c6c082982c5498101a558ed72eff107a5ea703578bbb04a"
+  },
+  "inputs": {
+    "strategy_apy_raw": 2938.1286657252813,
+    "tvl_usd": 899926.7854913577,
+    "underlyings": [
+      {
+        "underlying_address": "0x0A4C9cb2778aB3302996A34BeFCF9a8Bc288C33b",
+        "underlying_decimals": 6,
+        "underlying_id": 127,
+        "underlying_name": "XSGD",
+        "underlying_standard": "ERC20"
+      },
+      {
+        "underlying_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "underlying_decimals": 6,
+        "underlying_id": 1,
+        "underlying_name": "USDC",
+        "underlying_standard": "ERC20"
+      }
+    ]
+  },
+  "spec_version": "v0.1.0",
+  "status": "warn",
+  "target": {
+    "chain_id": 8453,
+    "strategy_id": 405,
+    "strategy_name": "XSGD/USDC 0.01",
+    "url": "https://arcadia.finance/farm/8453/v2?strategyId=405"
+  },
+  "timestamp_utc": "2026-02-10T12:44:06Z"
+}
