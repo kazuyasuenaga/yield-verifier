@@ -13,16 +13,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fetch strategy JSON (try multiple base URLs)
+      - name: Fetch Arcadia strategy data (Base 8453, strategyId=405)
         shell: bash
         run: |
           set -euo pipefail
 
           STRATEGY_ID="405"
+          CHAIN_ID="8453"
+
           TS="$(date -u +'%Y%m%dT%H%M%SZ')"
           OUT_DIR="data"
           OUT_FILE="${OUT_DIR}/arcadia_strategy_${STRATEGY_ID}_${TS}.json"
           LATEST_FILE="${OUT_DIR}/latest_strategy_${STRATEGY_ID}.json"
+          SOURCE_FILE="${OUT_DIR}/source_url_strategy_${STRATEGY_ID}.txt"
 
           mkdir -p "${OUT_DIR}"
 
@@ -32,78 +35,72 @@ jobs:
             "https://staging.api.arcadia.finance"
           )
 
-          # API path according to their docs listing (GET /v1/api/strategies/{strategy_id})
-          API_PATH="/v1/api/strategies/${STRATEGY_ID}"
-          
+          # The API returns 422 unless required query params are included.
+          # We'll try multiple candidate endpoint shapes to find the one that works.
+          URL_CANDIDATES=(
+            "/v1/api/strategies?chain_id=${CHAIN_ID}&query=${STRATEGY_ID}"
+            "/v1/api/strategies/${STRATEGY_ID}?chain_id=${CHAIN_ID}&query=${STRATEGY_ID}"
+            "/v1/api/strategy?chain_id=${CHAIN_ID}&query=${STRATEGY_ID}"
+          )
+
           echo "Target: strategy_id=${STRATEGY_ID}"
+          echo "Chain: ${CHAIN_ID}"
           echo "Timestamp (UTC): ${TS}"
           echo "Will try:"
           for b in "${BASE_URLS[@]}"; do
-            echo "  - ${b}${API_PATH}"
+            for p in "${URL_CANDIDATES[@]}"; do
+              echo "  - ${b}${p}"
+            done
           done
 
           SUCCESS=0
           LAST_ERR=""
 
           for BASE in "${BASE_URLS[@]}"; do
-            URL="${BASE}${API_PATH}"
-            echo ""
-            echo "== Trying: ${URL}"
-            
-            HTTP_TMP="$(mktemp)"
-            BODY_TMP="$(mktemp)"
-
-            set +e
-            curl -sS -L \
-              --retry 3 --retry-delay 2 --retry-all-errors \
-              -H "accept: application/json" \
-              -H "user-agent: yield-verifier/0.1 (github-actions)" \
-              -w "%{http_code}" \
-              -o "${BODY_TMP}" \
-              "${URL}" > "${HTTP_TMP}"
-            CURL_EXIT=$?
-            set -e
-
-            HTTP_CODE="$(cat "${HTTP_TMP}" || true)"
-            rm -f "${HTTP_TMP}"
-
-            if [ "${CURL_EXIT}" -ne 0 ]; then
-              LAST_ERR="curl failed (exit=${CURL_EXIT}) for ${URL}"
-              echo "${LAST_ERR}"
-              rm -f "${BODY_TMP}"
-              continue
-            fi
-
-            if [ "${HTTP_CODE}" != "200" ]; then
-              LAST_ERR="non-200 HTTP (${HTTP_CODE}) for ${URL}"
-              echo "${LAST_ERR}"
-              echo "Response (first 300 chars):"
-              head -c 300 "${BODY_TMP}" || true
+            for P in "${URL_CANDIDATES[@]}"; do
+              URL="${BASE}${P}"
               echo ""
-              rm -f "${BODY_TMP}"
-              continue
-            fi
+              echo "== Trying: ${URL}"
 
-            # Validate JSON using python (available on ubuntu-latest)
-            if python -m json.tool "${BODY_TMP}" > "${OUT_FILE}"; then
-              echo "JSON OK. Saved: ${OUT_FILE}"
-              cp "${OUT_FILE}" "${LATEST_FILE}"
-              echo "Also updated: ${LATEST_FILE}"
-              echo "${URL}" > "${OUT_DIR}/source_url_strategy_${STRATEGY_ID}.txt"
-              rm -f "${BODY_TMP}"
-              SUCCESS=1
-              break
-            else
-              LAST_ERR="invalid JSON from ${URL}"
-              echo "${LAST_ERR}"
-              rm -f "${BODY_TMP}"
-              continue
-            fi
+              HTTP_CODE="$(curl -sS -L \
+                --retry 3 --retry-delay 2 --retry-all-errors \
+                -H "accept: application/json" \
+                -H "user-agent: yield-verifier/0.1 (github-actions)" \
+                -w "%{http_code}" \
+                -o /tmp/arcadia_body.json \
+                "${URL}")" || true
+
+              if [ "${HTTP_CODE}" != "200" ]; then
+                LAST_ERR="non-200 HTTP (${HTTP_CODE}) for ${URL}"
+                echo "${LAST_ERR}"
+                echo "Response (first 300 chars):"
+                head -c 300 /tmp/arcadia_body.json || true
+                echo ""
+                continue
+              fi
+
+              # Validate JSON (pretty-print to OUT_FILE)
+              if python -m json.tool /tmp/arcadia_body.json > "${OUT_FILE}"; then
+                echo "JSON OK. Saved: ${OUT_FILE}"
+                cp "${OUT_FILE}" "${LATEST_FILE}"
+                echo "Also updated: ${LATEST_FILE}"
+                echo "${URL}" > "${SOURCE_FILE}"
+                SUCCESS=1
+                break 2
+              else
+                LAST_ERR="invalid JSON from ${URL}"
+                echo "${LAST_ERR}"
+                echo "Response (first 300 chars):"
+                head -c 300 /tmp/arcadia_body.json || true
+                echo ""
+                continue
+              fi
+            done
           done
 
           if [ "${SUCCESS}" -ne 1 ]; then
             echo ""
-            echo "ERROR: Could not fetch valid JSON for strategy_id=${STRATEGY_ID}."
+            echo "ERROR: Could not fetch valid JSON for strategy_id=${STRATEGY_ID} (chain_id=${CHAIN_ID})."
             echo "Last error: ${LAST_ERR}"
             exit 1
           fi
@@ -111,7 +108,6 @@ jobs:
       - name: Commit fetched data (if changed)
         run: |
           set -euo pipefail
-          git status --porcelain
           if [ -z "$(git status --porcelain)" ]; then
             echo "No changes to commit."
             exit 0
@@ -119,6 +115,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
-          git commit -m "data: fetch Arcadia strategy 405"
+          git commit -m "data: fetch Arcadia strategy 405 (chain 8453)"
           git push
-
