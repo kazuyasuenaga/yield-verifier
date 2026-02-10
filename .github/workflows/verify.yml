@@ -1,0 +1,182 @@
+name: verify
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build receipt from latest_strategy_405.json
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IN_FILE="data/latest_strategy_405.json"
+          OUT_DIR="artifacts"
+          TS="$(date -u +'%Y%m%dT%H%M%SZ')"
+          OUT_FILE="${OUT_DIR}/receipt.json"
+          SNAP_FILE="${OUT_DIR}/receipt_${TS}.json"
+
+          if [ ! -f "${IN_FILE}" ]; then
+            echo "ERROR: ${IN_FILE} not found. Run fetch_arcadia first."
+            exit 1
+          fi
+
+          mkdir -p "${OUT_DIR}"
+
+          python - << 'PY'
+          import json, hashlib, time, sys
+          from pathlib import Path
+
+          in_path = Path("data/latest_strategy_405.json")
+          raw = json.loads(in_path.read_text(encoding="utf-8"))
+
+          # --- Helpers ---
+          def sha256_hex(b: bytes) -> str:
+              return hashlib.sha256(b).hexdigest()
+
+          def canonical_json_bytes(obj) -> bytes:
+              return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+          # --- Extract minimal inputs ---
+          required_keys = ["strategy_id", "strategy_name", "strategy_apy"]
+          missing = [k for k in required_keys if k not in raw]
+
+          strategy_id = raw.get("strategy_id")
+          strategy_name = raw.get("strategy_name")
+          strategy_apy_raw = raw.get("strategy_apy")
+
+          # We also capture a few context fields if present:
+          underlyings = raw.get("underlyings", [])
+          details = raw.get("details", {})
+          tvl = None
+          if isinstance(details, dict):
+              tvl = details.get("total_value_locked")
+
+          # --- Unit ambiguity handling ---
+          # NOTE: We do NOT "decide" silently. We emit candidates and warn if ambiguous.
+          unit_hint = "unknown"
+          apy_candidates = {}
+          unit_ambiguous = True
+
+          try:
+              x = float(strategy_apy_raw)
+              apy_candidates["as_fraction"] = x  # interpret as already fraction (e.g. 0.033 = 3.3%)
+              apy_candidates["as_percent_div_100"] = x / 100.0  # interpret as percent (e.g. 3.3 => 0.033)
+              # Heuristic ONLY for warning level, not for choosing:
+              if 0 <= x <= 1:
+                  unit_hint = "likely_fraction"
+                  unit_ambiguous = False
+              else:
+                  unit_hint = "likely_percent_or_scaled"
+                  unit_ambiguous = True
+          except Exception:
+              unit_hint = "non_numeric"
+              unit_ambiguous = True
+
+          # --- Checks ---
+          checks = []
+
+          checks.append({
+              "name": "input_present",
+              "pass": len(missing) == 0,
+              "detail": ("missing: " + ", ".join(missing)) if missing else "ok"
+          })
+
+          checks.append({
+              "name": "unit_unambiguous",
+              "pass": (unit_ambiguous is False),
+              "detail": unit_hint
+          })
+
+          # Reproducibility: canonicalize inputs and outputs and hash them.
+          # Inputs for digest are the extracted minimal set + target identifiers.
+          inputs_for_digest = {
+              "target": {
+                  "chain_id": 8453,
+                  "strategy_id": strategy_id,
+                  "url": "https://arcadia.finance/farm/8453/v2?strategyId=405"
+              },
+              "raw_fields": {
+                  "strategy_apy": strategy_apy_raw,
+                  "strategy_name": strategy_name
+              },
+              "context": {
+                  "tvl": tvl,
+                  "underlyings": underlyings
+              }
+          }
+
+          # Output payload (receipt core)
+          receipt_core = {
+              "spec_version": "v0.1.0",
+              "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "target": {
+                  "chain_id": 8453,
+                  "strategy_id": strategy_id,
+                  "strategy_name": strategy_name,
+                  "url": "https://arcadia.finance/farm/8453/v2?strategyId=405"
+              },
+              "status": None,  # filled below
+              "inputs": {
+                  "strategy_apy_raw": strategy_apy_raw,
+                  "tvl_usd": tvl,
+                  "underlyings": underlyings
+              },
+              "assumptions": {
+                  "apy_unit": "unknown",
+                  "unit_hint": unit_hint,
+                  "note": "Until unit is confirmed, we publish multiple APY interpretations and mark status as warn."
+              },
+              "computed": {
+                  "apy_candidates_fraction": apy_candidates
+              },
+              "checks": checks,
+              "digests": {
+                  "input_digest_sha256": None,
+                  "output_digest_sha256": None
+              }
+          }
+
+          input_digest = sha256_hex(canonical_json_bytes(inputs_for_digest))
+          receipt_core["digests"]["input_digest_sha256"] = input_digest
+
+          # Determine status: fail if missing required, warn if unit ambiguous, pass otherwise.
+          if any(c["name"] == "input_present" and not c["pass"] for c in checks):
+              status = "fail"
+          elif any(c["name"] == "unit_unambiguous" and not c["pass"] for c in checks):
+              status = "warn"
+          else:
+              status = "pass"
+          receipt_core["status"] = status
+
+          output_digest = sha256_hex(canonical_json_bytes(receipt_core))
+          receipt_core["digests"]["output_digest_sha256"] = output_digest
+
+          Path("artifacts/receipt.json").write_text(json.dumps(receipt_core, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+          print("Wrote artifacts/receipt.json with status =", status)
+          PY
+
+          cp "${OUT_FILE}" "${SNAP_FILE}"
+          echo "Also wrote snapshot: ${SNAP_FILE}"
+
+      - name: Commit receipts (if changed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add artifacts/
+          git commit -m "receipt: verify strategy 405"
+          git push
