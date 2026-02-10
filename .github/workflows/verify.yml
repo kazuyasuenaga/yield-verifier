@@ -55,7 +55,6 @@ jobs:
 
           python - << 'PY'
           import json, hashlib, time, os, math
-
           from pathlib import Path
 
           def sha256_hex(b: bytes) -> str:
@@ -88,6 +87,7 @@ jobs:
           apy_fraction = None
           apy_percent_from_api = None
           unit_ok = False
+          unit_detail = "unknown"
           try:
               apy_fraction = float(strategy_apy_raw)
               apy_percent_from_api = apy_fraction * 100.0
@@ -134,7 +134,6 @@ jobs:
 
           realized_ok = True
           if principal_str or profit_str or hours_str:
-              # If any is provided, require all three
               if not (principal_str and profit_str and hours_str):
                   realized_ok = False
                   realized["notes"].append("If providing realized return, principal_usdc, profit_usdc, and duration_hours must all be set.")
@@ -146,12 +145,12 @@ jobs:
                       if principal <= 0 or hours <= 0:
                           raise ValueError("principal and duration must be > 0")
 
-                      roi = profit / principal  # over the window
+                      roi = profit / principal
                       periods_per_year = (365.0 * 24.0) / hours
 
-                      apr_simple = roi * periods_per_year  # linear annualization
+                      apr_simple = roi * periods_per_year
                       apy_daily = (1.0 + roi) ** periods_per_year - 1.0
-                      apy_cont = math.exp(roi * periods_per_year) - 1.0  # rough continuous-comp approx
+                      apy_cont = math.exp(roi * periods_per_year) - 1.0
 
                       realized.update({
                           "provided": True,
@@ -167,12 +166,40 @@ jobs:
                       realized_ok = False
                       realized["notes"].append(f"Invalid realized inputs: {e}")
 
+          # --- Headline vs realized gap ---
+          realized_apy_percent = None
+          headline_apy_percent = apy_percent_from_api
+          headline_to_realized_apy_ratio = None
+
+          if realized.get("provided") and realized.get("apy_compound_daily") is not None:
+              realized_apy_percent = float(realized["apy_compound_daily"]) * 100.0
+              if headline_apy_percent is not None and realized_apy_percent != 0:
+                  headline_to_realized_apy_ratio = headline_apy_percent / realized_apy_percent
+
+          # Check thresholds: warn if headline is >100x realized, fail if >5000x (adjust later)
+          gap_warn_ratio = 100.0
+          gap_fail_ratio = 5000.0
+          gap_check_pass = True
+          gap_detail = "not_applicable"
+
+          if headline_to_realized_apy_ratio is not None:
+              if headline_to_realized_apy_ratio > gap_fail_ratio:
+                  gap_check_pass = False
+                  gap_detail = f"ratio>{gap_fail_ratio}"
+              elif headline_to_realized_apy_ratio > gap_warn_ratio:
+                  gap_check_pass = False  # we treat this as warn via status logic below
+                  gap_detail = f"ratio>{gap_warn_ratio}"
+              else:
+                  gap_check_pass = True
+                  gap_detail = f"ratio<= {gap_warn_ratio}"
+
           # --- Checks ---
           checks = []
           checks.append({"name": "input_present", "pass": len(missing) == 0, "detail": ("missing: " + ", ".join(missing)) if missing else "ok"})
           checks.append({"name": "unit_confirmed", "pass": unit_ok, "detail": unit_detail})
           checks.append({"name": "displayed_match_within_tolerance", "pass": (deviation_check_pass if deviation_check_pass is not None else True), "detail": deviation_detail})
           checks.append({"name": "realized_inputs_valid", "pass": realized_ok, "detail": "ok" if realized_ok else "invalid_or_incomplete"})
+          checks.append({"name": "headline_vs_realized_gap", "pass": (gap_check_pass if headline_to_realized_apy_ratio is not None else True), "detail": gap_detail})
 
           # --- Digests ---
           inputs_for_digest = {
@@ -184,7 +211,7 @@ jobs:
           }
 
           receipt = {
-              "spec_version": "v0.3.0",
+              "spec_version": "v0.3.1",
               "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
               "target": {"chain_id": 8453, "strategy_id": strategy_id, "strategy_name": strategy_name, "url": "https://arcadia.finance/farm/8453/v2?strategyId=405"},
               "status": None,
@@ -203,14 +230,18 @@ jobs:
                   "apy_unit": "fraction",
                   "displayed_unit": "percent",
                   "conversion": "apy_percent = strategy_apy * 100",
-                  "realized_annualization": "apr_simple = roi * (365*24/duration_hours); apy_compound_daily = (1+roi)^(365*24/duration_hours)-1"
+                  "realized_annualization": "apr_simple = roi * (365*24/duration_hours); apy_compound_daily = (1+roi)^(365*24/duration_hours)-1",
+                  "gap_thresholds": {"warn_ratio": gap_warn_ratio, "fail_ratio": gap_fail_ratio}
               },
               "computed": {
                   "apy_fraction": apy_fraction,
                   "apy_percent_from_api": apy_percent_from_api,
                   "deviation_abs_percent": deviation_abs_percent,
                   "deviation_rel": deviation_rel,
-                  "realized": realized
+                  "realized": realized,
+                  "realized_apy_percent": realized_apy_percent,
+                  "headline_apy_percent": headline_apy_percent,
+                  "headline_to_realized_apy_ratio": headline_to_realized_apy_ratio
               },
               "checks": checks,
               "digests": {"input_digest_sha256": None, "output_digest_sha256": None}
@@ -227,6 +258,8 @@ jobs:
           elif any(c["name"] == "realized_inputs_valid" and not c["pass"] for c in checks):
               status = "fail"
           elif (deviation_check_pass is False):
+              status = "warn"
+          elif (headline_to_realized_apy_ratio is not None and headline_to_realized_apy_ratio > gap_warn_ratio):
               status = "warn"
           else:
               status = "pass"
@@ -251,5 +284,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add artifacts/
-          git commit -m "receipt: verify strategy 405 (add realized return)"
+          git commit -m "receipt: verify strategy 405 (headline vs realized gap)"
           git push
