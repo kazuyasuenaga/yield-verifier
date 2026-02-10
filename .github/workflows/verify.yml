@@ -4,7 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       displayed_apy_percent:
-        description: "APY shown on Arcadia website (percent, e.g. 293814.8). Leave blank if unknown."
+        description: "APY shown on Arcadia website (percent, e.g. 293814.8)."
+        required: false
+        default: ""
+      principal_usdc:
+        description: "Principal in USDC for realized-return calc (e.g. 1000)"
+        required: false
+        default: ""
+      profit_usdc:
+        description: "Realized profit in USDC over the window (e.g. 2.84)"
+        required: false
+        default: ""
+      duration_hours:
+        description: "Time window in hours (e.g. 18)"
         required: false
         default: ""
 
@@ -18,10 +30,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build receipt from latest_strategy_405.json
+      - name: Build receipt from latest_strategy_405.json (+ realized return if provided)
         shell: bash
         env:
           DISPLAYED_APY_PERCENT: ${{ github.event.inputs.displayed_apy_percent }}
+          PRINCIPAL_USDC: ${{ github.event.inputs.principal_usdc }}
+          PROFIT_USDC: ${{ github.event.inputs.profit_usdc }}
+          DURATION_HOURS: ${{ github.event.inputs.duration_hours }}
         run: |
           set -euo pipefail
 
@@ -39,13 +54,9 @@ jobs:
           mkdir -p "${OUT_DIR}"
 
           python - << 'PY'
-          import json, hashlib, time, sys, os
+          import json, hashlib, time, os, math
+
           from pathlib import Path
-
-          displayed_str = (os.environ.get("DISPLAYED_APY_PERCENT") or "").strip()
-
-          in_path = Path("data/latest_strategy_405.json")
-          raw = json.loads(in_path.read_text(encoding="utf-8"))
 
           def sha256_hex(b: bytes) -> str:
               return hashlib.sha256(b).hexdigest()
@@ -53,7 +64,15 @@ jobs:
           def canonical_json_bytes(obj) -> bytes:
               return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
-          # --- Required fields ---
+          # Read env inputs
+          displayed_str = (os.environ.get("DISPLAYED_APY_PERCENT") or "").strip()
+          principal_str = (os.environ.get("PRINCIPAL_USDC") or "").strip()
+          profit_str = (os.environ.get("PROFIT_USDC") or "").strip()
+          hours_str = (os.environ.get("DURATION_HOURS") or "").strip()
+
+          # Load latest strategy
+          raw = json.loads(Path("data/latest_strategy_405.json").read_text(encoding="utf-8"))
+
           required_keys = ["strategy_id", "strategy_name", "strategy_apy"]
           missing = [k for k in required_keys if k not in raw]
 
@@ -65,22 +84,19 @@ jobs:
           details = raw.get("details", {})
           tvl = details.get("total_value_locked") if isinstance(details, dict) else None
 
-          # --- Unit decision (confirmed by user observation) ---
+          # --- Arcadia unit: confirmed fraction ---
           apy_fraction = None
           apy_percent_from_api = None
           unit_ok = False
-          unit_detail = "unknown"
-
           try:
               apy_fraction = float(strategy_apy_raw)
               apy_percent_from_api = apy_fraction * 100.0
               unit_ok = True
               unit_detail = "confirmed: api_fraction * 100 = displayed_percent"
           except Exception:
-              unit_ok = False
               unit_detail = "strategy_apy not numeric"
 
-          # Optional: compare against website-displayed APY% if provided
+          # --- Compare with displayed APY% if provided ---
           displayed_apy_percent = None
           deviation_abs_percent = None
           deviation_rel = None
@@ -93,7 +109,6 @@ jobs:
                   if apy_percent_from_api is not None:
                       deviation_abs_percent = apy_percent_from_api - displayed_apy_percent
                       deviation_rel = deviation_abs_percent / displayed_apy_percent if displayed_apy_percent != 0 else None
-                      # Tolerance: very loose for now (we mainly want to detect gross mismatch)
                       tol = 0.005  # 0.5% relative tolerance
                       deviation_check_pass = (deviation_rel is not None and abs(deviation_rel) <= tol)
                       deviation_detail = f"rel_tol={tol}"
@@ -101,90 +116,115 @@ jobs:
                       deviation_check_pass = False
                       deviation_detail = "api_percent_unavailable"
               except Exception:
-                  displayed_apy_percent = None
                   deviation_check_pass = False
                   deviation_detail = "invalid_displayed_input"
 
+          # --- Realized return calculation (optional) ---
+          realized = {
+              "provided": False,
+              "principal_usdc": None,
+              "profit_usdc": None,
+              "duration_hours": None,
+              "roi": None,
+              "apr_simple": None,
+              "apy_compound_daily": None,
+              "apy_compound_continuous": None,
+              "notes": []
+          }
+
+          realized_ok = True
+          if principal_str or profit_str or hours_str:
+              # If any is provided, require all three
+              if not (principal_str and profit_str and hours_str):
+                  realized_ok = False
+                  realized["notes"].append("If providing realized return, principal_usdc, profit_usdc, and duration_hours must all be set.")
+              else:
+                  try:
+                      principal = float(principal_str)
+                      profit = float(profit_str)
+                      hours = float(hours_str)
+                      if principal <= 0 or hours <= 0:
+                          raise ValueError("principal and duration must be > 0")
+
+                      roi = profit / principal  # over the window
+                      periods_per_year = (365.0 * 24.0) / hours
+
+                      apr_simple = roi * periods_per_year  # linear annualization
+                      apy_daily = (1.0 + roi) ** periods_per_year - 1.0
+                      apy_cont = math.exp(roi * periods_per_year) - 1.0  # rough continuous-comp approx
+
+                      realized.update({
+                          "provided": True,
+                          "principal_usdc": principal,
+                          "profit_usdc": profit,
+                          "duration_hours": hours,
+                          "roi": roi,
+                          "apr_simple": apr_simple,
+                          "apy_compound_daily": apy_daily,
+                          "apy_compound_continuous": apy_cont
+                      })
+                  except Exception as e:
+                      realized_ok = False
+                      realized["notes"].append(f"Invalid realized inputs: {e}")
+
           # --- Checks ---
           checks = []
-          checks.append({
-              "name": "input_present",
-              "pass": len(missing) == 0,
-              "detail": ("missing: " + ", ".join(missing)) if missing else "ok"
-          })
-          checks.append({
-              "name": "unit_confirmed",
-              "pass": unit_ok,
-              "detail": unit_detail
-          })
-          checks.append({
-              "name": "displayed_match_within_tolerance",
-              "pass": (deviation_check_pass if deviation_check_pass is not None else True),
-              "detail": deviation_detail
-          })
+          checks.append({"name": "input_present", "pass": len(missing) == 0, "detail": ("missing: " + ", ".join(missing)) if missing else "ok"})
+          checks.append({"name": "unit_confirmed", "pass": unit_ok, "detail": unit_detail})
+          checks.append({"name": "displayed_match_within_tolerance", "pass": (deviation_check_pass if deviation_check_pass is not None else True), "detail": deviation_detail})
+          checks.append({"name": "realized_inputs_valid", "pass": realized_ok, "detail": "ok" if realized_ok else "invalid_or_incomplete"})
 
-          # Digests input: extracted + displayed (if provided) + identifiers
+          # --- Digests ---
           inputs_for_digest = {
-              "target": {
-                  "chain_id": 8453,
-                  "strategy_id": strategy_id,
-                  "url": "https://arcadia.finance/farm/8453/v2?strategyId=405"
-              },
-              "raw_fields": {
-                  "strategy_apy": strategy_apy_raw,
-                  "strategy_name": strategy_name
-              },
-              "context": {
-                  "tvl": tvl,
-                  "underlyings": underlyings
-              },
-              "user_observed": {
-                  "displayed_apy_percent": displayed_apy_percent
-              }
+              "target": {"chain_id": 8453, "strategy_id": strategy_id, "url": "https://arcadia.finance/farm/8453/v2?strategyId=405"},
+              "raw_fields": {"strategy_apy": strategy_apy_raw, "strategy_name": strategy_name},
+              "context": {"tvl": tvl, "underlyings": underlyings},
+              "user_observed": {"displayed_apy_percent": displayed_apy_percent},
+              "realized_inputs": {"principal_usdc": principal_str or None, "profit_usdc": profit_str or None, "duration_hours": hours_str or None}
           }
 
           receipt = {
-              "spec_version": "v0.2.1",
+              "spec_version": "v0.3.0",
               "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              "target": {
-                  "chain_id": 8453,
-                  "strategy_id": strategy_id,
-                  "strategy_name": strategy_name,
-                  "url": "https://arcadia.finance/farm/8453/v2?strategyId=405"
-              },
+              "target": {"chain_id": 8453, "strategy_id": strategy_id, "strategy_name": strategy_name, "url": "https://arcadia.finance/farm/8453/v2?strategyId=405"},
               "status": None,
               "inputs": {
                   "strategy_apy_raw_fraction": strategy_apy_raw,
                   "displayed_apy_percent_user": displayed_apy_percent,
                   "tvl_usd": tvl,
-                  "underlyings": underlyings
+                  "underlyings": underlyings,
+                  "realized_return": {
+                      "principal_usdc": realized["principal_usdc"],
+                      "profit_usdc": realized["profit_usdc"],
+                      "duration_hours": realized["duration_hours"]
+                  }
               },
               "assumptions": {
                   "apy_unit": "fraction",
                   "displayed_unit": "percent",
                   "conversion": "apy_percent = strategy_apy * 100",
-                  "note": "Unit confirmed using Arcadia UI observation."
+                  "realized_annualization": "apr_simple = roi * (365*24/duration_hours); apy_compound_daily = (1+roi)^(365*24/duration_hours)-1"
               },
               "computed": {
                   "apy_fraction": apy_fraction,
                   "apy_percent_from_api": apy_percent_from_api,
                   "deviation_abs_percent": deviation_abs_percent,
-                  "deviation_rel": deviation_rel
+                  "deviation_rel": deviation_rel,
+                  "realized": realized
               },
               "checks": checks,
-              "digests": {
-                  "input_digest_sha256": None,
-                  "output_digest_sha256": None
-              }
+              "digests": {"input_digest_sha256": None, "output_digest_sha256": None}
           }
 
-          input_digest = sha256_hex(canonical_json_bytes(inputs_for_digest))
-          receipt["digests"]["input_digest_sha256"] = input_digest
+          receipt["digests"]["input_digest_sha256"] = sha256_hex(canonical_json_bytes(inputs_for_digest))
+          receipt["digests"]["output_digest_sha256"] = sha256_hex(canonical_json_bytes(receipt))
 
-          # Status logic
+          # --- Status ---
           if any(c["name"] == "input_present" and not c["pass"] for c in checks):
               status = "fail"
           elif any(c["name"] == "unit_confirmed" and not c["pass"] for c in checks):
+              status = "fail"
+          elif any(c["name"] == "realized_inputs_valid" and not c["pass"] for c in checks):
               status = "fail"
           elif (deviation_check_pass is False):
               status = "warn"
@@ -193,13 +233,7 @@ jobs:
 
           receipt["status"] = status
 
-          output_digest = sha256_hex(canonical_json_bytes(receipt))
-          receipt["digests"]["output_digest_sha256"] = output_digest
-
-          Path("artifacts/receipt.json").write_text(
-              json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False),
-              encoding="utf-8"
-          )
+          Path("artifacts/receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
           print("Wrote artifacts/receipt.json with status =", status)
           PY
 
@@ -217,5 +251,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add artifacts/
-          git commit -m "receipt: verify strategy 405 (unit confirmed)"
+          git commit -m "receipt: verify strategy 405 (add realized return)"
           git push
